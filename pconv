@@ -1,0 +1,87 @@
+import numpy as np
+
+def quantize_multiplier(real_multiplier):
+    if real_multiplier == 0:
+        return 0, 0
+    significand, shift = np.frexp(np.float64(real_multiplier))  # significand ∈ [0.5, 1)
+    M = int(np.round(significand * (1 << 31)))
+    if M == (1 << 31):
+        M //= 2
+        shift += 1
+    return M, 31 - shift
+
+def bankers_rounding(x):
+    # Assumes x is int
+    if x & 1 == 0:
+        return x >> 1
+    else:
+        return (x + 1) >> 1 if (x & 2) else (x - 1) >> 1
+
+def fused_conv2d_int8(
+    input_tensor,   # shape: (H, W, C_in), dtype=int8
+    weights,        # shape: (C_out, K_h, K_w, C_in), dtype=int8
+    biases,         # shape: (C_out,), dtype=int32
+    input_scale,
+    weight_scales,  # list of scales, len = C_out
+    output_scale,
+    input_zp,
+    weight_zps,     # per output channel
+    output_zp,
+    strides=(1, 1),
+    padding="VALID"
+):
+    H, W, C_in = input_tensor.shape
+    C_out, K_h, K_w, _ = weights.shape
+    stride_y, stride_x = strides
+
+    # Output shape
+    if padding == "SAME":
+        out_H = int(np.ceil(H / stride_y))
+        out_W = int(np.ceil(W / stride_x))
+        pad_along_height = max((out_H - 1) * stride_y + K_h - H, 0)
+        pad_along_width = max((out_W - 1) * stride_x + K_w - W, 0)
+        pad_top = pad_along_height // 2
+        pad_left = pad_along_width // 2
+    else:  # VALID
+        out_H = (H - K_h) // stride_y + 1
+        out_W = (W - K_w) // stride_x + 1
+        pad_top = pad_left = 0
+
+    # Pad input
+    padded_input = np.pad(
+        input_tensor,
+        ((pad_top, pad_top), (pad_left, pad_left), (0, 0)),
+        mode="constant",
+        constant_values=input_zp
+    )
+
+    output = np.zeros((out_H, out_W, C_out), dtype=np.int8)
+
+    # Compute per-channel M, n
+    M_n_pairs = [quantize_multiplier(input_scale * weight_scales[c] / output_scale) for c in range(C_out)]
+
+    for y in range(out_H):
+        for x in range(out_W):
+            for c_out in range(C_out):
+                acc = 0
+                for ky in range(K_h):
+                    for kx in range(K_w):
+                        for c_in in range(C_in):
+                            in_y = y * stride_y + ky
+                            in_x = x * stride_x + kx
+                            inp_val = int(padded_input[in_y, in_x, c_in]) - int(input_zp)
+                            weight_val = int(weights[c_out, ky, kx, c_in]) - int(weight_zps[c_out])
+                            acc += inp_val * weight_val
+
+                acc += biases[c_out]
+
+                M, n = M_n_pairs[c_out]
+                acc = int((acc * M + (1 << (n - 1))) >> n)
+                acc += output_zp
+
+                # Clip to int8 and apply ReLU
+                acc = max(acc, output_zp)
+                acc = np.clip(acc, -128, 127)
+                output[y, x, c_out] = np.int8(acc)
+
+    return output
