@@ -1,0 +1,82 @@
+import numpy as np
+import tensorflow as tf
+
+def calculate_scale_and_zp(min_val, max_val, num_bits=8):
+    qmin, qmax = -128, 127
+    scale = np.float64((max_val - min_val) / (qmax - qmin))
+    if scale == 0: scale = 1e-8  # prevent divide-by-zero
+    zp = int(np.round(-min_val / scale)) + qmin
+    zp = np.clip(zp, qmin, qmax)
+    return scale, zp
+
+def quantize_tensor(tensor, scale, zp):
+    return np.clip(np.round(tensor / scale + zp), -128, 127).astype(np.int8)
+
+def run_model_and_capture_activations(model, representative_data):
+    layer_outputs = [layer.output for layer in model.layers if isinstance(layer, tf.keras.layers.Conv2D)]
+    activation_model = tf.keras.Model(inputs=model.input, outputs=layer_outputs)
+    all_activations = []
+    for sample in representative_data:
+        sample = np.expand_dims(sample, axis=0)
+        activations = activation_model(sample)
+        if not isinstance(activations, list):
+            activations = [activations]
+        all_activations.append(activations)
+    return all_activations
+
+def custom_post_training_quantization_channelwise(model, representative_data):
+    quantized_layers = {}
+
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.Conv2D):
+            weights, biases = layer.get_weights()  # weights: (H, W, in_C, out_C)
+            out_channels = weights.shape[-1]
+
+            q_weights = np.zeros_like(weights, dtype=np.int8)
+            weight_scales = np.zeros(out_channels, dtype=np.float64)
+            weight_zps = np.zeros(out_channels, dtype=np.int32)
+
+            for i in range(out_channels):
+                kernel = weights[:, :, :, i]
+                w_min, w_max = np.min(kernel), np.max(kernel)
+                scale, zp = calculate_scale_and_zp(w_min, w_max)
+                weight_scales[i] = scale
+                weight_zps[i] = zp
+                q_weights[:, :, :, i] = quantize_tensor(kernel, scale, zp)
+
+            q_biases = np.zeros_like(biases, dtype=np.int32)
+            # Bias quantization: scale = input_scale * weight_scale[channel]
+            # delay until we know input scale
+
+            quantized_layers[layer.name] = {
+                "weights": q_weights,
+                "weight_scales": weight_scales,
+                "weight_zero_points": weight_zps,
+                "biases_float": biases  # we'll quantize after input scale is known
+            }
+
+    # Capture activation ranges for per-layer input/output
+    all_activations = run_model_and_capture_activations(model, representative_data)
+
+    for i, layer in enumerate([l for l in model.layers if isinstance(l, tf.keras.layers.Conv2D)]):
+        layer_acts = np.concatenate([a[i].numpy().flatten() for a in all_activations])
+        act_min, act_max = np.min(layer_acts), np.max(layer_acts)
+        scale_a, zp_a = calculate_scale_and_zp(act_min, act_max)
+
+        # Set activation scale + zero point
+        layer_q = quantized_layers[layer.name]
+        layer_q['input_scale'] = scale_a
+        layer_q['input_zero_point'] = zp_a
+
+        # Now quantize biases per channel
+        q_biases = []
+        for j in range(layer_q['weights'].shape[-1]):
+            bias = layer_q['biases_float'][j]
+            scale = scale_a * layer_q['weight_scales'][j]
+            q_bias = int(np.round(bias / scale))
+            q_biases.append(np.clip(q_bias, -2**31, 2**31 - 1))
+        layer_q['biases'] = np.array(q_biases, dtype=np.int32)
+
+        del layer_q['biases_float']  # cleanup
+
+    return quantized_layers
